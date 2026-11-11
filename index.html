@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Procedural Spider</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: radial-gradient(ellipse at center, #efe9de 0%, #ddd5c6 70%, #cfc6b5 100%);
+    cursor: crosshair;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #hint {
+    position: fixed; left: 16px; bottom: 14px;
+    font: 13px/1.4 system-ui, sans-serif; color: #7a6d5c;
+    user-select: none; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Move the mouse — the spider follows. Scroll to resize · <b>D</b> toggles debug view</div>
+<script>
+'use strict';
+
+// ---------- setup ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const shadowCv = document.createElement('canvas');
+const sctx = shadowCv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  for (const c of [canvas, shadowCv]) { c.width = W * DPR; c.height = H * DPR; }
+}
+resize();
+addEventListener('resize', resize);
+
+const TAU = Math.PI * 2, D2R = Math.PI / 180;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => t * t * (3 - 2 * t);
+const rand = (a, b) => a + Math.random() * (b - a);
+const angDiff = (a, b) => { let d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// ---------- input ----------
+const mouse = { x: W / 2, y: H / 2 };
+const setMouse = e => { mouse.x = e.clientX; mouse.y = e.clientY; };
+addEventListener('pointermove', setMouse);
+addEventListener('pointerdown', setMouse);
+
+let S = 1.1; // spider scale
+addEventListener('wheel', e => { S = clamp(S * Math.exp(-e.deltaY * 0.001), 0.45, 2.6); }, { passive: true });
+let debug = false;
+addEventListener('keydown', e => { if (e.key === 'd' || e.key === 'D') debug = !debug; });
+
+// ---------- spider ----------
+const spider = {
+  x: W / 2, y: H / 2, vx: 0, vy: 0,
+  a: -Math.PI / 2, av: 0,       // heading + angular velocity
+  abd: 0,                      // abdomen lag angle
+  offX: 0, offY: 0,            // body sway toward support polygon
+  z: 18,                       // body height (for shadow)
+  idle: 0, pause: 0, time: 0,
+};
+
+// Per-leg geometry (angles in degrees from "forward", mirrored for left/right)
+const DEFS = [
+  { hip: 38,  rest: 36,  dist: 94, l1: 54, l2: 62 },
+  { hip: 68,  rest: 76,  dist: 82, l1: 47, l2: 53 },
+  { hip: 108, rest: 118, dist: 74, l1: 42, l2: 48 },
+  { hip: 142, rest: 154, dist: 90, l1: 52, l2: 58 },
+];
+const HIP_RX = 10, HIP_RY = 8.5;
+
+const legs = [];
+for (const side of [-1, 1]) for (let i = 0; i < 4; i++) {
+  legs.push({
+    side, i, d: DEFS[i],
+    foot: { x: 0, y: 0 }, from: { x: 0, y: 0 }, jit: { x: 0, y: 0 },
+    ideal: { x: 0, y: 0 }, rest: { x: 0, y: 0 }, err: 0,
+    stepping: false, t: 0, dur: 0.15, lift: 0, liftH: 10, tapTarget: null,
+  });
+}
+// neighbours: adjacent legs on the same side + the mirrored leg -> they never lift together
+for (const L of legs) {
+  L.nb = legs.filter(o => o !== L &&
+    ((o.side === L.side && Math.abs(o.i - L.i) === 1) || (o.side !== L.side && o.i === L.i)));
+}
+
+function toWorld(lx, ly, px = spider.x, py = spider.y, a = spider.a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return { x: px + lx * c - ly * s, y: py + lx * s + ly * c };
+}
+function hipLocal(L) {
+  const ang = L.d.hip * D2R;
+  return { x: Math.cos(ang) * HIP_RX * S, y: L.side * Math.sin(ang) * HIP_RY * S };
+}
+function restLocal(L) {
+  const ang = L.d.rest * D2R;
+  return { x: Math.cos(ang) * L.d.dist * S + 2 * S, y: L.side * Math.sin(ang) * L.d.dist * S };
+}
+
+for (const L of legs) {
+  const r = restLocal(L);
+  L.foot = toWorld(r.x, r.y);
+}
+
+const prints = []; // fading footprints
+
+function startStep(L, speed, tapTarget = null) {
+  const sp = speed / S;
+  L.stepping = true;
+  L.t = 0;
+  L.from = { x: L.foot.x, y: L.foot.y };
+  L.tapTarget = tapTarget;
+  if (tapTarget) {
+    L.dur = rand(0.22, 0.32);
+    L.liftH = rand(14, 22) * S;
+  } else {
+    L.dur = clamp(0.24 - sp * 0.0006, 0.09, 0.24) * rand(0.9, 1.1);
+    L.liftH = (8 + sp * 0.04) * S;
+  }
+  L.jit = { x: rand(-3, 3) * S, y: rand(-3, 3) * S };
+}
+
+// cheap smooth 1D noise
+const noise = t => (Math.sin(t * 1.3) + 0.6 * Math.sin(t * 2.9 + 1.7) + 0.3 * Math.sin(t * 5.3 + 4.1)) / 1.9;
+
+function update(dt) {
+  spider.time += dt;
+  const t = spider.time;
+
+  // --- locomotion: steer toward the cursor ---
+  const dx = mouse.x - spider.x, dy = mouse.y - spider.y;
+  const d = Math.hypot(dx, dy);
+  let speed = Math.hypot(spider.vx, spider.vy);
+
+  const maxSpeed = 230 * S * (0.85 + 0.25 * noise(t * 0.8));
+  let desired = d > 4 * S ? maxSpeed * Math.sqrt(clamp((d - 4 * S) / (150 * S), 0, 1)) : 0;
+
+  // occasional hesitation: real spiders move in bursts
+  if (spider.pause > 0) spider.pause -= dt;
+  else if (speed > 110 * S && Math.random() < dt * 0.25) spider.pause = rand(0.12, 0.45);
+  if (spider.pause > 0) desired = 0;
+
+  const targetAng = Math.atan2(dy, dx);
+  const diff = angDiff(spider.a, targetAng);
+  const wantAv = d > 12 * S ? clamp(diff * 6, -6.5, 6.5) : 0;
+  spider.av = lerp(spider.av, wantAv, clamp(dt * 10, 0, 1));
+  spider.a += spider.av * dt;
+
+  // walk mostly forward, slow down while turning sharply
+  desired *= 0.2 + 0.8 * clamp(Math.cos(diff), 0, 1);
+  let mx = 0, my = 0;
+  if (d > 0.001) {
+    mx = Math.cos(spider.a) * 0.6 + (dx / d) * 0.4;
+    my = Math.sin(spider.a) * 0.6 + (dy / d) * 0.4;
+    const m = Math.hypot(mx, my) || 1; mx /= m; my /= m;
+  }
+  const k = clamp(dt * (desired < speed ? 9 : 4), 0, 1);
+  spider.vx = lerp(spider.vx, mx * desired, k);
+  spider.vy = lerp(spider.vy, my * desired, k);
+  spider.x += spider.vx * dt;
+  spider.y += spider.vy * dt;
+  speed = Math.hypot(spider.vx, spider.vy);
+
+  if (speed < 8 * S && Math.abs(spider.av) < 0.3) spider.idle += dt; else spider.idle = 0;
+
+  // --- legs: decide where each foot "wants" to be ---
+  const th = 22 * S + speed * 0.16;                 // step trigger distance
+  const lead = Math.min(1, speed / (40 * S)) * th * 0.5;
+  const vdx = speed > 0.01 ? spider.vx / speed : 0, vdy = speed > 0.01 ? spider.vy / speed : 0;
+
+  for (const L of legs) {
+    const r = restLocal(L);
+    L.rest = toWorld(r.x, r.y);
+    L.ideal = { x: L.rest.x + vdx * lead, y: L.rest.y + vdy * lead };
+    L.err = dist(L.foot, L.ideal);
+    const hl = hipLocal(L), hip = toWorld(hl.x, hl.y);
+    L.strain = dist(hip, L.foot) / ((L.d.l1 + L.d.l2) * S);
+  }
+
+  // --- gait: biggest-error legs step first, but never next to a lifted neighbour ---
+  const cands = legs.filter(L => !L.stepping && (L.err > th || L.strain > 0.9)).sort((a, b) => b.err - a.err);
+  for (const L of cands) {
+    if (L.err > th * 1.8 || L.strain > 0.97 || !L.nb.some(n => n.stepping)) startStep(L, speed);
+  }
+
+  // --- idle: settle feet one at a time, and occasionally "taste" the ground ---
+  if (spider.idle > 0.25) {
+    for (const L of legs) {
+      if (!L.stepping && L.err > 3 * S && !L.nb.some(n => n.stepping) && Math.random() < dt * 5) {
+        startStep(L, 0);
+      }
+    }
+  }
+  if (spider.idle > 1.5 && Math.random() < dt * 0.45) {
+    const pool = legs.filter(L => L.i <= (Math.random() < 0.8 ? 0 : 1));
+    const L = pool[Math.floor(Math.random() * pool.length)];
+    if (!L.stepping && !L.nb.some(n => n.stepping)) {
+      const r = restLocal(L);
+      const tgt = toWorld(r.x + rand(8, 20) * S, r.y + L.side * rand(-6, 8) * S);
+      startStep(L, 0, tgt);
+    }
+  }
+
+  // --- animate steps ---
+  let lifted = 0;
+  for (const L of legs) {
+    if (!L.stepping) continue;
+    lifted++;
+    L.t += dt / L.dur;
+    const target = L.tapTarget || { x: L.ideal.x + L.jit.x, y: L.ideal.y + L.jit.y };
+    if (L.t >= 1) {
+      L.foot = { x: target.x, y: target.y };
+      L.stepping = false;
+      L.lift = 0;
+      L.tapTarget = null;
+      prints.push({ x: L.foot.x, y: L.foot.y, life: 1, r: 1.6 * S });
+      if (prints.length > 260) prints.shift();
+    } else {
+      const e = smooth(L.t);
+      L.foot.x = lerp(L.from.x, target.x, e);
+      L.foot.y = lerp(L.from.y, target.y, e);
+      L.lift = Math.sin(Math.PI * L.t) * L.liftH;
+    }
+  }
+
+  // --- body follows its support: sway toward planted feet, dip when legs are lifted ---
+  let ax = 0, ay = 0, n = 0;
+  for (const L of legs) if (!L.stepping) { ax += L.foot.x - L.rest.x; ay += L.foot.y - L.rest.y; n++; }
+  if (n) { ax /= n; ay /= n; }
+  spider.offX = lerp(spider.offX, ax * 0.18, clamp(dt * 8, 0, 1));
+  spider.offY = lerp(spider.offY, ay * 0.18, clamp(dt * 8, 0, 1));
+  const breathe = Math.sin(t * 2.3);
+  spider.z = lerp(spider.z, (18 + breathe * 1.2 - lifted * 0.8) * S, clamp(dt * 10, 0, 1));
+  spider.abd = lerp(spider.abd, clamp(-spider.av * 0.1, -0.35, 0.35), clamp(dt * 4, 0, 1));
+
+  for (const p of prints) p.life -= dt * 0.25;
+  while (prints.length && prints[0].life <= 0) prints.shift();
+}
+
+// ---------- rendering ----------
+const LIGHT = { x: 0.45, y: 0.7 }; // shadow offset per unit height
+const LEG_COL = '#1e1611';
+
+function legPoints(L, bx, by) {
+  const hl = hipLocal(L);
+  const hip = toWorld(hl.x, hl.y, bx, by);
+  let fx = L.foot.x, fy = L.foot.y;
+  // while swinging, the leg folds a little toward the body
+  if (L.lift > 0) {
+    const ox = hip.x - fx, oy = hip.y - fy, m = Math.hypot(ox, oy) || 1;
+    fx += ox / m * L.lift * 0.3; fy += oy / m * L.lift * 0.3;
+  }
+  const l1 = L.d.l1 * S, l2 = L.d.l2 * S;
+  let ddx = fx - hip.x, ddy = fy - hip.y;
+  let dd = Math.hypot(ddx, ddy) || 0.001;
+  const ux = ddx / dd, uy = ddy / dd;
+  const dc = clamp(dd, Math.abs(l1 - l2) + 1, l1 + l2 - 0.5);
+  const a = (l1 * l1 - l2 * l2 + dc * dc) / (2 * dc);
+  const h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+  // front legs: knees point out & back (elbows); rear legs: out & forward
+  const sign = L.side * (L.i < 2 ? 1 : -1);
+  const nx = -uy * sign, ny = ux * sign;
+  const knee = { x: hip.x + ux * a + nx * h, y: hip.y + uy * a + ny * h };
+  const foot = { x: fx, y: fy };
+  const mid = {
+    x: lerp(knee.x, foot.x, 0.5) + nx * 2.5 * S,
+    y: lerp(knee.y, foot.y, 0.5) + ny * 2.5 * S,
+  };
+  const kneeZ = spider.z + 10 * S + h * 0.35;
+  return { hip, knee, mid, foot, z: [spider.z, kneeZ, (kneeZ + L.lift) * 0.5, L.lift] };
+}
+
+function strokeLeg(c, P, off) {
+  const pts = [P.hip, P.knee, P.mid, P.foot].map((p, j) =>
+    off ? { x: p.x + LIGHT.x * P.z[j], y: p.y + LIGHT.y * P.z[j] } : p);
+  const widths = [4.8, 3.2, 2.0];
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  for (let j = 0; j < 3; j++) {
+    c.lineWidth = widths[j] * S;
+    c.beginPath(); c.moveTo(pts[j].x, pts[j].y); c.lineTo(pts[j + 1].x, pts[j + 1].y); c.stroke();
+  }
+  return pts;
+}
+
+function ellipse(c, x, y, rx, ry, rot = 0) {
+  c.beginPath(); c.ellipse(x, y, rx, ry, rot, 0, TAU);
+}
+
+function drawBodyShape(c, bx, by, shadow) {
+  const t = spider.time;
+  c.save();
+  c.translate(bx, by);
+  c.rotate(spider.a);
+  c.scale(S, S);
+
+  // pedipalps
+  const moving = Math.hypot(spider.vx, spider.vy) > 20 * S;
+  for (const side of [-1, 1]) {
+    const w = moving ? Math.sin(t * 14 + side) * 1.6 : Math.sin(t * 2.7 + side * 1.3) * 1.2 + Math.max(0, Math.sin(t * 0.9 + side)) * 2;
+    const p0 = { x: 10, y: side * 5.5 }, p1 = { x: 17 + w * 0.5, y: side * (8.5 + w) }, p2 = { x: 23 + w, y: side * (6 + w * 0.6) };
+    c.lineCap = 'round';
+    c.strokeStyle = shadow ? '#000' : '#241a13';
+    c.lineWidth = 2.6; c.beginPath(); c.moveTo(p0.x, p0.y); c.lineTo(p1.x, p1.y); c.stroke();
+    c.lineWidth = 2.1; c.beginPath(); c.moveTo(p1.x, p1.y); c.lineTo(p2.x, p2.y); c.stroke();
+    if (!shadow) { c.fillStyle = '#3a2a1e'; ellipse(c, p2.x, p2.y, 1.5, 1.3); c.fill(); }
+  }
+
+  // abdomen (lags behind turns, breathes)
+  c.save();
+  c.translate(-9, 0);
+  c.rotate(spider.abd);
+  c.translate(-18, 0);
+  const br = 1 + 0.03 * Math.sin(t * 2.3);
+  c.scale(br, 1 + 0.045 * Math.sin(t * 2.3));
+  if (shadow) {
+    c.fillStyle = '#000'; ellipse(c, 0, 0, 21, 16); c.fill();
+  } else {
+    const g = c.createRadialGradient(5, -5, 2, 0, 0, 24);
+    g.addColorStop(0, '#5a4130'); g.addColorStop(0.55, '#2c1f16'); g.addColorStop(1, '#130d09');
+    c.fillStyle = g; ellipse(c, 0, 0, 21, 16); c.fill();
+    // markings
+    c.strokeStyle = 'rgba(225,195,145,0.38)'; c.lineWidth = 1.5; c.lineCap = 'round'; c.lineJoin = 'round';
+    for (let k = 0; k < 4; k++) {
+      const x = 9 - k * 6.5, s = 7 - k * 1.1;
+      c.beginPath(); c.moveTo(x - 4, -s); c.lineTo(x, 0); c.lineTo(x - 4, s); c.stroke();
+    }
+    c.fillStyle = 'rgba(225,195,145,0.3)';
+    for (let k = 0; k < 3; k++) for (const sd of [-1, 1]) { ellipse(c, 6 - k * 8, sd * (9 - k), 1.4, 1.1); c.fill(); }
+    c.fillStyle = 'rgba(255,255,255,0.07)'; ellipse(c, 5, -6, 9, 4, -0.2); c.fill();
+  }
+  c.restore();
+
+  // pedicel
+  c.fillStyle = shadow ? '#000' : '#1a120c'; ellipse(c, -10, 0, 4, 3); c.fill();
+
+  // cephalothorax
+  if (shadow) {
+    c.fillStyle = '#000'; ellipse(c, 0, 0, 13.5, 11.5); c.fill();
+  } else {
+    const g = c.createRadialGradient(3, -3, 1, 0, 0, 14);
+    g.addColorStop(0, '#5e4533'); g.addColorStop(0.6, '#33241a'); g.addColorStop(1, '#1a120c');
+    c.fillStyle = g; ellipse(c, 0, 0, 13.5, 11.5); c.fill();
+    c.strokeStyle = 'rgba(0,0,0,0.35)'; c.lineWidth = 0.8;
+    for (let k = 0; k < 8; k++) {
+      const an = (k / 8) * TAU;
+      c.beginPath(); c.moveTo(-1 + Math.cos(an) * 2, Math.sin(an) * 2); c.lineTo(-1 + Math.cos(an) * 9, Math.sin(an) * 7.5); c.stroke();
+    }
+    // chelicerae
+    c.fillStyle = '#1b130d';
+    for (const sd of [-1, 1]) { ellipse(c, 12.5, sd * 3.2, 4, 2.8, sd * 0.2); c.fill(); }
+    // eyes
+    const eyes = [[9.6, 2.4, 2.1], [8.8, 5.2, 1.3], [6.6, 3.3, 1.1], [6.0, 6.4, 1.3]];
+    for (const [ex, ey, er] of eyes) for (const sd of [-1, 1]) {
+      c.fillStyle = '#050505'; ellipse(c, ex, sd * ey, er, er); c.fill();
+      c.fillStyle = 'rgba(255,255,255,0.75)'; ellipse(c, ex + er * 0.3, sd * ey - er * 0.35, er * 0.35, er * 0.35); c.fill();
+    }
+  }
+  c.restore();
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  // footprints
+  for (const p of prints) {
+    ctx.fillStyle = `rgba(70,52,36,${0.14 * p.life})`;
+    ellipse(ctx, p.x, p.y, p.r, p.r); ctx.fill();
+  }
+
+  const bx = spider.x + spider.offX, by = spider.y + spider.offY;
+  const pts = legs.map(L => legPoints(L, bx, by));
+
+  // shadows: drawn opaque on an offscreen canvas, then composited once (no overlap darkening)
+  sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  sctx.clearRect(0, 0, W, H);
+  sctx.strokeStyle = '#000';
+  for (const P of pts) strokeLeg(sctx, P, true);
+  drawBodyShape(sctx, bx + LIGHT.x * spider.z, by + LIGHT.y * spider.z, true);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 0.2;
+  ctx.filter = `blur(${2.5 * DPR}px)`;
+  ctx.drawImage(shadowCv, 0, 0);
+  ctx.restore();
+
+  // legs
+  for (let k = 0; k < legs.length; k++) {
+    const L = legs[k], P = pts[k];
+    ctx.strokeStyle = debug && L.stepping ? '#b5452e' : LEG_COL;
+    strokeLeg(ctx, P, false);
+    ctx.fillStyle = '#3b2b1f';
+    ellipse(ctx, P.knee.x, P.knee.y, 2.7 * S, 2.7 * S); ctx.fill();
+    ellipse(ctx, P.mid.x, P.mid.y, 1.8 * S, 1.8 * S); ctx.fill();
+  }
+
+  drawBodyShape(ctx, bx, by, false);
+
+  if (debug) {
+    const speed = Math.hypot(spider.vx, spider.vy);
+    const th = 22 * S + speed * 0.16;
+    ctx.lineWidth = 1;
+    for (const L of legs) {
+      ctx.strokeStyle = 'rgba(40,110,200,0.35)';
+      ellipse(ctx, L.ideal.x, L.ideal.y, th, th); ctx.stroke();
+      ctx.fillStyle = '#2a6ec8'; ellipse(ctx, L.ideal.x, L.ideal.y, 2.5, 2.5); ctx.fill();
+      ctx.strokeStyle = 'rgba(42,110,200,0.6)';
+      ctx.beginPath(); ctx.moveTo(L.ideal.x, L.ideal.y); ctx.lineTo(L.foot.x, L.foot.y); ctx.stroke();
+    }
+    ctx.fillStyle = '#c33'; ellipse(ctx, mouse.x, mouse.y, 3, 3); ctx.fill();
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
