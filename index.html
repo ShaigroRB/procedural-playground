@@ -11,6 +11,33 @@
     cursor: crosshair;
   }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #opts {
+    position: fixed; top: 12px; right: 12px;
+    background: rgba(255,255,255,0.65); border: 1px solid rgba(0,0,0,0.1); border-radius: 8px;
+    padding: 8px 12px; font: 12px/1.4 system-ui, sans-serif; color: #4a3f33; cursor: default;
+    backdrop-filter: blur(4px);
+  }
+  #opts label { display: flex; align-items: center; gap: 8px; }
+  #opts input[type=range] { width: 120px; }
+  #opts output { width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+  #opts summary { cursor: pointer; margin-top: 6px; font-weight: 600; }
+  #legGrid { display: grid; grid-template-columns: auto repeat(5, auto); gap: 2px 8px; align-items: center; margin-top: 4px; }
+  #legGrid .h { font-weight: 600; text-align: center; color: #7a6d5c; }
+  #legGrid .cell { display: flex; align-items: center; gap: 3px; }
+  #legGrid input[type=range] { width: 56px; }
+  #legGrid output { width: 2.4em; font-size: 11px; }
+  #opts .btns { display: flex; gap: 6px; margin-top: 8px; }
+  #opts button {
+    flex: 1; font: inherit; padding: 3px 8px; border-radius: 5px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,0.18); background: rgba(255,255,255,0.8); color: inherit;
+  }
+  #opts button:hover { background: #fff; }
+  #opts .row { display: flex; gap: 6px; margin-top: 6px; }
+  #opts .row input[type=text], #opts .row select {
+    flex: 2; min-width: 0; font: inherit; padding: 3px 6px; border-radius: 5px;
+    border: 1px solid rgba(0,0,0,0.18); background: rgba(255,255,255,0.85); color: inherit;
+  }
+  #cfgMsg { margin-top: 4px; min-height: 1.4em; color: #7a6d5c; }
   #hint {
     position: fixed; left: 16px; bottom: 14px;
     font: 13px/1.4 system-ui, sans-serif; color: #7a6d5c;
@@ -20,6 +47,21 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="opts">
+  <label>Speed <input id="speed" type="range" min="0.1" max="2.5" step="0.05" value="1"><output id="speedOut">1.00×</output></label>
+  <details open>
+    <summary>Legs (per pair, mirrored left/right)</summary>
+    <div id="legGrid"></div>
+    <label style="margin-top:6px">Variation <input id="variation" type="range" min="0" max="0.6" step="0.01"><output id="variationOut"></output></label>
+    <div class="btns"><button id="randomize" type="button">Randomize</button><button id="reset" type="button">Reset defaults</button></div>
+  </details>
+  <details>
+    <summary>Saved configurations</summary>
+    <div class="row"><input id="cfgName" type="text" placeholder="Name" maxlength="40"><button id="cfgSave" type="button">Save</button></div>
+    <div class="row"><select id="cfgList"></select><button id="cfgLoad" type="button">Load</button><button id="cfgDelete" type="button">Delete</button></div>
+    <div id="cfgMsg"></div>
+  </details>
+</div>
 <div id="hint">Move the mouse — the spider follows. Scroll to resize · <b>D</b> toggles debug view</div>
 <script>
 'use strict';
@@ -47,14 +89,22 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 // ---------- input ----------
 const mouse = { x: W / 2, y: H / 2 };
-const setMouse = e => { mouse.x = e.clientX; mouse.y = e.clientY; };
+const opts = document.getElementById('opts');
+// ignore the pointer while it is over the options box, so tweaking doesn't steer the spider
+const setMouse = e => { if (opts.contains(e.target)) return; mouse.x = e.clientX; mouse.y = e.clientY; };
+let speedMul = 1;
+const speedIn = document.getElementById('speed'), speedOut = document.getElementById('speedOut');
+speedIn.addEventListener('input', () => { speedMul = +speedIn.value; speedOut.textContent = speedMul.toFixed(2) + '×'; });
 addEventListener('pointermove', setMouse);
 addEventListener('pointerdown', setMouse);
 
 let S = 1.1; // spider scale
 addEventListener('wheel', e => { S = clamp(S * Math.exp(-e.deltaY * 0.001), 0.45, 2.6); }, { passive: true });
 let debug = false;
-addEventListener('keydown', e => { if (e.key === 'd' || e.key === 'D') debug = !debug; });
+addEventListener('keydown', e => {
+  if (e.target.closest && e.target.closest('input[type=text], select')) return;
+  if (e.key === 'd' || e.key === 'D') debug = !debug;
+});
 
 // ---------- spider ----------
 const spider = {
@@ -68,12 +118,135 @@ const spider = {
 
 // Per-leg geometry (angles in degrees from "forward", mirrored for left/right)
 const DEFS = [
-  { hip: 38,  rest: 36,  dist: 94, l1: 54, l2: 62 },
+  { hip: 30,  rest: 22,  dist: 94, l1: 54, l2: 62 },
   { hip: 68,  rest: 76,  dist: 82, l1: 47, l2: 53 },
   { hip: 108, rest: 118, dist: 74, l1: 42, l2: 48 },
   { hip: 142, rest: 154, dist: 90, l1: 52, l2: 58 },
 ];
 const HIP_RX = 10, HIP_RY = 8.5;
+
+// Per-pair motion settings (index 0 = front pair).
+//  angle:  resting direction of the leg, degrees from "forward" (mirrored left/right)
+//  length: leg length (segments + resting distance)
+//  stride: how far the foot drifts before stepping, and how far ahead it lands
+//  lift:   step height
+//  tempo:  swing speed (higher = snappier swing)
+const MOTION_DEFAULTS = [
+  { angle: 22,  length: 1, stride: 1.25, lift: 1.6, tempo: 0.9 },  // front: long, exploratory reaches
+  { angle: 76,  length: 1, stride: 1.05, lift: 1.1, tempo: 1.0 },
+  { angle: 118, length: 1, stride: 0.85, lift: 0.8, tempo: 1.15 }, // short, quick steps
+  { angle: 154, length: 1, stride: 0.95, lift: 0.7, tempo: 1.1 },  // back: low pushing steps
+];
+const VARIATION_DEFAULT = 0.25;            // per-step randomness of stride & timing
+const MOTION_RANGES = {
+  angle: [0, 180, 1], length: [0.5, 1.8, 0.05], stride: [0.5, 2, 0.05], lift: [0.2, 3, 0.05], tempo: [0.5, 2, 0.05],
+};
+const KEYS = Object.keys(MOTION_RANGES);
+const fmt = (key, v) => key === 'angle' ? Math.round(v) + '°' : v.toFixed(2);
+const motion = MOTION_DEFAULTS.map(m => ({ ...m }));
+let variation = VARIATION_DEFAULT;
+
+const PAIR_NAMES = ['1 front', '2', '3', '4 back'];
+const motionInputs = [];
+(function buildLegUI() {
+  const grid = document.getElementById('legGrid');
+  grid.insertAdjacentHTML('beforeend', '<span></span>' + KEYS.map(k => `<span class="h">${k}</span>`).join(''));
+  motion.forEach((m, i) => {
+    grid.insertAdjacentHTML('beforeend', `<span>Pair ${PAIR_NAMES[i]}</span>`);
+    for (const key of KEYS) {
+      const [min, max, step] = MOTION_RANGES[key];
+      const cell = document.createElement('span'); cell.className = 'cell';
+      const inp = Object.assign(document.createElement('input'), { type: 'range', min, max, step });
+      const out = document.createElement('output');
+      inp.addEventListener('input', () => { m[key] = +inp.value; out.textContent = fmt(key, m[key]); });
+      cell.append(inp, out); grid.append(cell);
+      motionInputs.push({ inp, out, i, key });
+    }
+  });
+})();
+const varIn = document.getElementById('variation'), varOut = document.getElementById('variationOut');
+varIn.addEventListener('input', () => { variation = +varIn.value; varOut.textContent = variation.toFixed(2); });
+
+function syncUI() {
+  for (const { inp, out, i, key } of motionInputs) { inp.value = motion[i][key]; out.textContent = fmt(key, motion[i][key]); }
+  varIn.value = variation; varOut.textContent = variation.toFixed(2);
+  speedIn.value = speedMul; speedOut.textContent = speedMul.toFixed(2) + '×';
+}
+document.getElementById('reset').addEventListener('click', () => {
+  MOTION_DEFAULTS.forEach((d, i) => Object.assign(motion[i], d));
+  variation = VARIATION_DEFAULT;
+  syncUI();
+});
+document.getElementById('randomize').addEventListener('click', () => {
+  motion.forEach((m, i) => {
+    for (const key of KEYS) {
+      const [min, max, step] = MOTION_RANGES[key];
+      let v;
+      if (key === 'angle') {
+        v = MOTION_DEFAULTS[i].angle + rand(-25, 25); // keep pairs roughly in order front -> back
+      } else {
+        // bias toward the middle of the range so results are usually walkable
+        v = min + (max - min) * (Math.random() + Math.random()) / 2;
+      }
+      m[key] = clamp(Math.round(v / step) * step, min, max);
+    }
+  });
+  variation = Math.round(rand(0, 0.5) * 100) / 100;
+  syncUI();
+});
+syncUI();
+
+// ---------- saved configurations (localStorage) ----------
+const CFG_KEY = 'proc-spider:configs';
+const cfgName = document.getElementById('cfgName'), cfgList = document.getElementById('cfgList');
+const cfgMsg = document.getElementById('cfgMsg');
+function readConfigs() {
+  try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch { return {}; }
+}
+function writeConfigs(all) {
+  try { localStorage.setItem(CFG_KEY, JSON.stringify(all)); return true; } catch { return false; }
+}
+function refreshCfgList(selected) {
+  const names = Object.keys(readConfigs()).sort((a, b) => a.localeCompare(b));
+  cfgList.innerHTML = '';
+  if (!names.length) cfgList.append(new Option('(none saved)', ''));
+  for (const n of names) cfgList.append(new Option(n, n, false, n === selected));
+}
+const say = msg => { cfgMsg.textContent = msg; };
+document.getElementById('cfgSave').addEventListener('click', () => {
+  const name = cfgName.value.trim();
+  if (!name) { say('Enter a name first.'); cfgName.focus(); return; }
+  const all = readConfigs();
+  const existed = name in all;
+  all[name] = { speed: speedMul, variation, motion: motion.map(m => ({ ...m })) };
+  if (!writeConfigs(all)) { say('Could not save (storage unavailable).'); return; }
+  refreshCfgList(name);
+  say(existed ? `Updated "${name}".` : `Saved "${name}".`);
+});
+document.getElementById('cfgLoad').addEventListener('click', () => {
+  const name = cfgList.value, cfg = readConfigs()[name];
+  if (!cfg) { say('Nothing to load.'); return; }
+  if (typeof cfg.speed === 'number') speedMul = cfg.speed;
+  if (typeof cfg.variation === 'number') variation = cfg.variation;
+  (cfg.motion || []).forEach((m, i) => {
+    if (!motion[i]) return;
+    for (const key of KEYS) if (typeof m[key] === 'number') motion[i][key] = m[key];
+  });
+  cfgName.value = name;
+  syncUI();
+  say(`Loaded "${name}".`);
+});
+document.getElementById('cfgDelete').addEventListener('click', () => {
+  const name = cfgList.value, all = readConfigs();
+  if (!(name in all)) { say('Nothing to delete.'); return; }
+  if (!confirm(`Delete configuration "${name}"?`)) return;
+  delete all[name];
+  writeConfigs(all);
+  refreshCfgList();
+  say(`Deleted "${name}".`);
+});
+cfgList.addEventListener('change', () => { if (cfgList.value) cfgName.value = cfgList.value; });
+refreshCfgList();
 
 const legs = [];
 for (const side of [-1, 1]) for (let i = 0; i < 4; i++) {
@@ -82,6 +255,7 @@ for (const side of [-1, 1]) for (let i = 0; i < 4; i++) {
     foot: { x: 0, y: 0 }, from: { x: 0, y: 0 }, jit: { x: 0, y: 0 },
     ideal: { x: 0, y: 0 }, rest: { x: 0, y: 0 }, err: 0,
     stepping: false, t: 0, dur: 0.15, lift: 0, liftH: 10, tapTarget: null,
+    rnd: 1, th: 0, // per-step random stride factor, current trigger distance
   });
 }
 // neighbours: adjacent legs on the same side + the mirrored leg -> they never lift together
@@ -95,12 +269,12 @@ function toWorld(lx, ly, px = spider.x, py = spider.y, a = spider.a) {
   return { x: px + lx * c - ly * s, y: py + lx * s + ly * c };
 }
 function hipLocal(L) {
-  const ang = L.d.hip * D2R;
+  const ang = clamp(L.d.hip + (motion[L.i].angle - L.d.rest) * 0.5, 15, 165) * D2R;
   return { x: Math.cos(ang) * HIP_RX * S, y: L.side * Math.sin(ang) * HIP_RY * S };
 }
 function restLocal(L) {
-  const ang = L.d.rest * D2R;
-  return { x: Math.cos(ang) * L.d.dist * S + 2 * S, y: L.side * Math.sin(ang) * L.d.dist * S };
+  const ang = motion[L.i].angle * D2R;
+  return { x: Math.cos(ang) * L.d.dist * S * motion[L.i].length + 2 * S, y: L.side * Math.sin(ang) * L.d.dist * S * motion[L.i].length };
 }
 
 for (const L of legs) {
@@ -112,6 +286,7 @@ const prints = []; // fading footprints
 
 function startStep(L, speed, tapTarget = null) {
   const sp = speed / S;
+  const m = motion[L.i];
   L.stepping = true;
   L.t = 0;
   L.from = { x: L.foot.x, y: L.foot.y };
@@ -120,10 +295,12 @@ function startStep(L, speed, tapTarget = null) {
     L.dur = rand(0.22, 0.32);
     L.liftH = rand(14, 22) * S;
   } else {
-    L.dur = clamp(0.22 - sp * 0.0004, 0.075, 0.22) * rand(0.9, 1.1);
-    L.liftH = (8 + sp * 0.04) * S;
+    L.dur = clamp(0.22 - sp * 0.0004, 0.075, 0.22) / m.tempo * rand(1 - variation * 0.6, 1 + variation * 0.6);
+    L.liftH = (8 + sp * 0.04) * S * m.lift * rand(1 - variation * 0.5, 1 + variation * 0.5);
   }
-  L.jit = { x: rand(-3, 3) * S, y: rand(-3, 3) * S };
+  const j = (1 + variation * 10) * S;
+  L.jit = { x: rand(-j, j), y: rand(-j, j) };
+  L.rnd = rand(1 - variation, 1 + variation); // this leg's stride for its next stance
 }
 
 // cheap smooth 1D noise
@@ -138,7 +315,7 @@ function update(dt) {
   const d = Math.hypot(dx, dy);
   let speed = Math.hypot(spider.vx, spider.vy);
 
-  const maxSpeed = 340 * S * (0.85 + 0.25 * noise(t * 0.8));
+  const maxSpeed = 340 * S * speedMul * (0.85 + 0.25 * noise(t * 0.8));
   let desired = d > 4 * S ? maxSpeed * Math.sqrt(clamp((d - 4 * S) / (150 * S), 0, 1)) : 0;
 
   // occasional hesitation: real spiders move in bursts
@@ -146,14 +323,19 @@ function update(dt) {
   else if (speed > 110 * S && Math.random() < dt * 0.25) spider.pause = rand(0.12, 0.45);
   if (spider.pause > 0) desired = 0;
 
+  // the body waits for its legs: slow down when planted legs are near full stretch
+  let strain = 0;
+  for (const L of legs) if (!L.stepping) strain = Math.max(strain, L.strain || 0);
+  const hold = clamp((0.94 - strain) / 0.1, 0.05, 1);
+
   const targetAng = Math.atan2(dy, dx);
   const diff = angDiff(spider.a, targetAng);
   const wantAv = d > 12 * S ? clamp(diff * 8, -9, 9) : 0;
   spider.av = lerp(spider.av, wantAv, clamp(dt * 10, 0, 1));
-  spider.a += spider.av * dt;
+  spider.a += spider.av * hold * dt;
 
   // walk mostly forward, slow down while turning sharply
-  desired *= 0.2 + 0.8 * clamp(Math.cos(diff), 0, 1);
+  desired *= (0.2 + 0.8 * clamp(Math.cos(diff), 0, 1)) * hold;
   let mx = 0, my = 0;
   if (d > 0.001) {
     mx = Math.cos(spider.a) * 0.6 + (dx / d) * 0.4;
@@ -171,27 +353,36 @@ function update(dt) {
 
   // --- legs: decide where each foot "wants" to be ---
   const th = 22 * S + speed * 0.16;                 // step trigger distance
-  const lead = Math.min(1, speed / (40 * S)) * th * 0.5;
+  const leadK = Math.min(1, speed / (40 * S)) * 0.5;
   const vdx = speed > 0.01 ? spider.vx / speed : 0, vdy = speed > 0.01 ? spider.vy / speed : 0;
 
   for (const L of legs) {
     const r = restLocal(L);
     L.rest = toWorld(r.x, r.y);
     const hl = hipLocal(L), hip = toWorld(hl.x, hl.y, spider.x + spider.offX, spider.y + spider.offY);
-    const reach = (L.d.l1 + L.d.l2) * S;
+    const reach = (L.d.l1 + L.d.l2) * S * motion[L.i].length;
+    L.th = th * motion[L.i].stride * Math.sqrt(motion[L.i].length) * L.rnd;
+    const lead = leadK * L.th;
     let ix = L.rest.x + vdx * lead, iy = L.rest.y + vdy * lead;
     // never aim a step beyond what the leg can comfortably reach
     const ox = ix - hip.x, oy = iy - hip.y, m = Math.hypot(ox, oy);
     if (m > reach * 0.82) { ix = hip.x + ox / m * reach * 0.82; iy = hip.y + oy / m * reach * 0.82; }
     L.ideal = { x: ix, y: iy };
+    // last resort: a planted foot pulled past full reach slips along instead of stretching the leg
+    const fx = L.foot.x - hip.x, fy = L.foot.y - hip.y, fm = Math.hypot(fx, fy);
+    if (!L.stepping && fm > reach * 0.98) {
+      L.foot = { x: hip.x + fx / fm * reach * 0.98, y: hip.y + fy / fm * reach * 0.98 };
+    }
     L.err = dist(L.foot, L.ideal);
     L.strain = dist(hip, L.foot) / reach;
   }
 
   // --- gait: biggest-error legs step first, but never next to a lifted neighbour ---
-  const cands = legs.filter(L => !L.stepping && (L.err > th || L.strain > 0.84)).sort((a, b) => b.err - a.err);
+  const cands = legs.filter(L => !L.stepping && (L.err > L.th || L.strain > 0.84)).sort((a, b) => b.err / b.th - a.err / a.th);
+  let airborne = legs.filter(L => L.stepping).length;
   for (const L of cands) {
-    if (L.err > th * 1.8 || L.strain > 0.9 || !L.nb.some(n => n.stepping)) startStep(L, speed);
+    const emergency = airborne < 4 && (L.err > L.th * 1.8 || L.strain > 0.9);
+    if (emergency || !L.nb.some(n => n.stepping)) { startStep(L, speed); airborne++; }
   }
 
   // --- idle: settle feet one at a time, and occasionally "taste" the ground ---
@@ -261,7 +452,7 @@ function legPoints(L, bx, by) {
     const ox = hip.x - fx, oy = hip.y - fy, m = Math.hypot(ox, oy) || 1;
     fx += ox / m * L.lift * 0.3; fy += oy / m * L.lift * 0.3;
   }
-  const l1 = L.d.l1 * S, l2 = L.d.l2 * S;
+  const len = motion[L.i].length, l1 = L.d.l1 * S * len, l2 = L.d.l2 * S * len;
   // a swinging (airborne) foot is dragged along rather than over-stretching the leg
   if (L.stepping) {
     const ox = fx - hip.x, oy = fy - hip.y, m = Math.hypot(ox, oy), maxR = (l1 + l2) * 0.97;
@@ -400,12 +591,10 @@ function render() {
   drawBody(bx, by, false);
 
   if (debug) {
-    const speed = Math.hypot(spider.vx, spider.vy);
-    const th = 22 * S + speed * 0.16;
     ctx.lineWidth = 1;
     for (const L of legs) {
       ctx.strokeStyle = 'rgba(40,110,200,0.35)';
-      ellipse(ctx, L.ideal.x, L.ideal.y, th, th); ctx.stroke();
+      ellipse(ctx, L.ideal.x, L.ideal.y, L.th, L.th); ctx.stroke();
       ctx.fillStyle = '#2a6ec8'; ellipse(ctx, L.ideal.x, L.ideal.y, 2.5, 2.5); ctx.fill();
       ctx.strokeStyle = 'rgba(42,110,200,0.6)';
       ctx.beginPath(); ctx.moveTo(L.ideal.x, L.ideal.y); ctx.lineTo(L.foot.x, L.foot.y); ctx.stroke();
